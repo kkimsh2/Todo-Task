@@ -16,6 +16,7 @@ import uuid
 from datetime import date, datetime, time as dtime, timedelta
 from io import BytesIO
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -26,12 +27,15 @@ DATA_DIR = BASE_DIR / "data"
 DATA_FILE = DATA_DIR / "worklog.csv"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 AI_REPORTS_FILE = DATA_DIR / "ai_reports.json"
-AI_MODEL = "claude-opus-5"
+AI_MODEL = "gemini-3.8-flash"  # 환경변수/secrets의 GEMINI_MODEL로 변경 가능
+AI_FALLBACK_MODELS = ["gemini-flash-latest", "gemini-3.5-flash"]  # 서버 과부하 시 순서대로 시도
 BACKUP_DIR = BASE_DIR / "backups"
 BACKUP_PREFIX = "[백업] 업무일지_"
 
 CATEGORIES = ["행정", "인사", "차량", "개인", "디자인"]
 STATUSES = ["대기", "진행중", "완료", "보류"]
+STATUS_VIEW_ORDER = ["진행중", "대기", "보류", "완료"]  # 업무 목록 분류 순서
+STATUS_ICONS = {"진행중": "🔵", "대기": "⏳", "보류": "⏸️", "완료": "✅"}
 COLUMNS = ["id", "작성일", "구분", "업무요약", "업무내용", "시작시간", "끝시간", "소요시간(분)", "진행상태", "비고"]
 DUR = "소요시간(분)"
 
@@ -43,10 +47,21 @@ DEFAULT_SETTINGS = {
     "standard_min": 480,       # 과중 업무 판단 기준(분)
     "last_auto_backup": "",
     "report_title": "과장님",  # 카카오톡 보고 받는 분 호칭
-    "anthropic_api_key": "",   # 환경변수 ANTHROPIC_API_KEY가 있으면 그쪽 우선
+    "gemini_api_key": "",      # 환경변수·.streamlit/secrets.toml의 GEMINI_API_KEY가 있으면 그쪽 우선
 }
 
 _file_lock = threading.Lock()
+
+KST = ZoneInfo("Asia/Seoul")
+
+
+def now_kst() -> datetime:
+    """서버 시간대(UTC 등)와 무관하게 한국 표준시 현재 시각 (naive, 기존 값들과 비교 가능)."""
+    return datetime.now(KST).replace(tzinfo=None)
+
+
+def today_kst() -> date:
+    return now_kst().date()
 
 
 # ─────────────────────────────── 데이터 계층 ───────────────────────────────
@@ -180,6 +195,11 @@ def save_settings(s: dict) -> None:
 
 # ─────────────────────────────── 보고 텍스트 ───────────────────────────────
 
+def nl2br(text: str) -> str:
+    """HTML 이스케이프 + 줄바꿈을 <br>로. (st.markdown 안에서 빈 줄이 HTML을 끊지 않도록)"""
+    return html.escape(str(text).replace("\r\n", "\n")).replace("\n", "<br>")
+
+
 def build_report(df: pd.DataFrame, target: date, kind: str) -> tuple[str, int]:
     rows = df[(df["작성일"] == target) & (df["업무요약"] != "")]
     lines = []
@@ -188,13 +208,13 @@ def build_report(df: pd.DataFrame, target: date, kind: str) -> tuple[str, int]:
             lines.append(f"- {r['업무요약']}")
         else:
             head = f"[{r['구분']}] " if r["구분"] else ""
-            detail = " ".join(r["업무내용"].split("\n")).strip()
-            lines.append(f"- {head}{r['업무요약']}" + (f" - {detail}" if detail else ""))
+            detail = [l.strip() for l in r["업무내용"].splitlines() if l.strip()]
+            lines.append(f"- {head}{r['업무요약']}" + (" - " + "\n   ".join(detail) if detail else ""))
     return "\n".join(lines), len(lines)
 
 
 def day_label(target: date) -> str:
-    return "금일" if target == date.today() else f"{target.month}월 {target.day}일"
+    return "금일" if target == today_kst() else f"{target.month}월 {target.day}일"
 
 
 def build_kakao_template(df: pd.DataFrame, target: date, title: str) -> str:
@@ -219,7 +239,7 @@ def load_ai_reports() -> dict:
 
 def save_ai_report(target: date, result: dict) -> None:
     data = load_ai_reports()
-    data[target.isoformat()] = {**result, "created": datetime.now().isoformat(timespec="seconds")}
+    data[target.isoformat()] = {**result, "created": now_kst().isoformat(timespec="seconds")}
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with _file_lock:
         AI_REPORTS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -248,13 +268,25 @@ AI_SCHEMA = {
 }
 
 
+def secret_value(name: str) -> str:
+    """환경변수 → .streamlit/secrets.toml 순으로 조회. 없으면 빈 문자열."""
+    if os.environ.get(name, "").strip():
+        return os.environ[name].strip()
+    try:
+        import streamlit as st
+        return str(st.secrets.get(name, "")).strip()
+    except Exception:  # secrets.toml 없음 등
+        return ""
+
+
 def resolve_api_key(settings: dict) -> str:
-    return os.environ.get("ANTHROPIC_API_KEY", "").strip() or str(settings.get("anthropic_api_key", "")).strip()
+    return secret_value("GEMINI_API_KEY") or str(settings.get("gemini_api_key", "")).strip()
 
 
 def generate_ai_report(df: pd.DataFrame, target: date, title: str, api_key: str) -> dict:
-    """Claude로 보고용 요약 + 카카오톡 메시지 생성. 실패 시 RuntimeError(사용자용 메시지)."""
-    import anthropic
+    """Gemini로 보고용 요약 + 카카오톡 메시지 생성. 실패 시 RuntimeError(사용자용 메시지)."""
+    from google import genai
+    from google.genai import errors, types
 
     rows = df[(df["작성일"] == target) & (df["업무요약"] != "")]
     entries = []
@@ -265,35 +297,43 @@ def generate_ai_report(df: pd.DataFrame, target: date, title: str, api_key: str)
     user_msg = (f"호칭: {title}\n날짜표현: {day_label(target)}\n날짜: {target.isoformat()}\n\n"
                 f"업무 기록(JSON):\n{json.dumps(entries, ensure_ascii=False, indent=1)}")
 
-    client = anthropic.Anthropic(api_key=api_key, timeout=90.0)
+    client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=90_000))
+    config = types.GenerateContentConfig(
+        system_instruction=AI_SYSTEM_PROMPT,
+        response_mime_type="application/json",
+        response_json_schema=AI_SCHEMA,
+        max_output_tokens=8000,
+    )
+    models = [secret_value("GEMINI_MODEL") or AI_MODEL, *AI_FALLBACK_MODELS]
     try:
-        resp = client.beta.messages.create(
-            model=AI_MODEL,
-            max_tokens=4000,
-            system=AI_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_msg}],
-            output_config={"effort": "low", "format": {"type": "json_schema", "schema": AI_SCHEMA}},
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
-        )
-    except anthropic.AuthenticationError:
-        raise RuntimeError("API 키가 올바르지 않습니다. 키를 다시 확인해 주세요.")
-    except anthropic.PermissionDeniedError:
-        raise RuntimeError("이 API 키로는 모델을 사용할 권한이 없습니다.")
-    except anthropic.RateLimitError:
-        raise RuntimeError("요청이 많아 잠시 제한되었습니다. 1분 뒤 다시 시도해 주세요.")
-    except anthropic.APIStatusError as e:
-        raise RuntimeError(f"AI 서버 오류({e.status_code}): {e.message}")
-    except anthropic.APIConnectionError:
+        for i, model in enumerate(models):
+            try:
+                resp = client.models.generate_content(model=model, contents=user_msg, config=config)
+                break
+            except errors.APIError as e:
+                # 모델 없음(404)·과부하(503)·한도(429)면 다음 모델로 재시도
+                if e.code not in (404, 429, 500, 503) or i == len(models) - 1:
+                    raise
+    except errors.ClientError as e:
+        if e.code in (400, 401, 403) and "API key" in str(e):
+            raise RuntimeError("API 키가 올바르지 않습니다. 키를 다시 확인해 주세요.")
+        if e.code == 403:
+            raise RuntimeError("이 API 키로는 모델을 사용할 권한이 없습니다.")
+        if e.code == 429:
+            raise RuntimeError("요청이 많아 잠시 제한되었습니다. 1분 뒤 다시 시도해 주세요.")
+        raise RuntimeError(f"AI 요청 오류({e.code}): {e.message}")
+    except errors.APIError as e:
+        raise RuntimeError(f"AI 서버 오류({e.code}): {e.message}")
+    except Exception:
         raise RuntimeError("AI 서버에 연결하지 못했습니다. 인터넷 연결을 확인해 주세요.")
 
-    if resp.stop_reason == "refusal":
-        raise RuntimeError("AI가 이 내용의 요약을 거절했습니다. 기본 양식을 사용해 주세요.")
-    if resp.stop_reason == "max_tokens":
+    finish = resp.candidates[0].finish_reason if resp.candidates else None
+    if finish == types.FinishReason.MAX_TOKENS:
         raise RuntimeError("업무가 너무 많아 답변이 잘렸습니다. 다시 시도해 주세요.")
-    text = next((b.text for b in resp.content if b.type == "text"), "")
+    if not resp.text:
+        raise RuntimeError("AI가 이 내용의 요약을 거절했습니다. 기본 양식을 사용해 주세요.")
     try:
-        data = json.loads(text)
+        data = json.loads(resp.text)
     except json.JSONDecodeError:
         raise RuntimeError("AI 응답을 읽지 못했습니다. 다시 시도해 주세요.")
     return {"report": data["report"].strip(), "kakao": data["kakao"].strip()}
@@ -309,7 +349,7 @@ def list_backups() -> list[Path]:
 
 def create_backup() -> Path:
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    dest = BACKUP_DIR / f"{BACKUP_PREFIX}{datetime.now():%Y%m%d_%H%M%S}.csv"
+    dest = BACKUP_DIR / f"{BACKUP_PREFIX}{now_kst():%Y%m%d_%H%M%S}.csv"
     with _file_lock:
         if DATA_FILE.exists():
             shutil.copy2(DATA_FILE, dest)
@@ -336,7 +376,7 @@ def restore_backup(path: Path) -> None:
 
 
 def run_scheduled_backup_if_due(now: datetime | None = None) -> Path | None:
-    now = now or datetime.now()
+    now = now or now_kst()
     s = load_settings()
     if not s["auto_backup"] or now.hour < int(s["backup_hour"]):
         return None
@@ -364,6 +404,8 @@ def main() -> None:
     import plotly.express as px
     import plotly.graph_objects as go
     import streamlit as st
+
+    from time_picker import time_picker
 
     st.set_page_config(page_title="업무일지 & KPI", page_icon="📋", layout="wide")
 
@@ -499,56 +541,62 @@ def main() -> None:
         st.markdown(f'<div class="kpi-grid">{"".join(items)}</div>', unsafe_allow_html=True)
 
     def task_cards(view: pd.DataFrame, category_options: list[str]) -> None:
-        """휴대폰용 카드 목록. 카드마다 '수정' 영역에서 편집/삭제."""
+        """카드 목록: PC 한 줄 4열 (휴대폰은 Streamlit이 자동으로 1열로 쌓음). 카드마다 '수정'에서 편집/삭제."""
         if view.empty:
             st.caption("등록된 업무가 없습니다.")
             return
-        for _, r in view.iterrows():
-            t = ""
-            if r["시작시간"] or r["끝시간"]:
-                s = r["시작시간"].strftime("%H:%M") if r["시작시간"] else "--:--"
-                e = r["끝시간"].strftime("%H:%M") if r["끝시간"] else "--:--"
-                dur = "" if pd.isna(r[DUR]) else f" · {int(r[DUR])}분"
-                t = f"{s}~{e}{dur}"
-            date_txt = f"{r['작성일']:%m/%d} " if r["작성일"] else ""
-            cat = f'<span class="badge badge-cat">{html.escape(r["구분"])}</span>' if r["구분"] else ""
-            detail = f'<div class="task-detail">{html.escape(r["업무내용"])}</div>' if r["업무내용"] else ""
-            st.markdown(
-                f'<div class="task-card"><div class="task-top">{cat}'
-                f'<span class="badge st-{r["진행상태"]}">{html.escape(r["진행상태"])}</span>'
-                f'<span class="task-time">{date_txt}{t}</span></div>'
-                f'<div class="task-title">{html.escape(r["업무요약"])}</div>{detail}</div>',
-                unsafe_allow_html=True,
-            )
-            with st.expander("수정"):
-                with st.form(f"edit_{r['id']}"):
-                    cats = category_options if r["구분"] in category_options else category_options + [r["구분"]]
-                    e_cat = st.selectbox("구분", cats, index=cats.index(r["구분"]) if r["구분"] in cats else 0)
-                    e_status = st.selectbox("진행상태", STATUSES, index=STATUSES.index(r["진행상태"]))
-                    e_summary = st.text_input("업무요약", r["업무요약"])
-                    e_detail = st.text_area("업무내용", r["업무내용"], height=80)
-                    c1, c2 = st.columns(2)
-                    e_start = c1.time_input("시작", r["시작시간"], step=300)
-                    e_end = c2.time_input("끝", r["끝시간"], step=300)
-                    e_date = st.date_input("작성일", r["작성일"] or date.today(), format="YYYY-MM-DD")
-                    e_note = st.text_input("비고", r["비고"])
-                    b1, b2 = st.columns(2)
-                    saved = b1.form_submit_button("저장", type="primary", width="stretch")
-                    deleted = b2.form_submit_button("🗑 삭제", width="stretch")
-                if saved or deleted:
-                    all_df = load_data()
-                    if deleted:
-                        all_df = all_df[all_df["id"] != r["id"]]
-                        st.toast("삭제했습니다.", icon="🗑")
-                    else:
-                        mask = all_df["id"] == r["id"]
-                        for col, val in [("구분", e_cat), ("진행상태", e_status), ("업무요약", e_summary),
-                                         ("업무내용", e_detail), ("시작시간", e_start), ("끝시간", e_end),
-                                         ("작성일", e_date), ("비고", e_note)]:
-                            all_df.loc[mask, col] = pd.Series([val] * mask.sum(), index=all_df.index[mask], dtype=object)
-                        st.toast("저장되었습니다.", icon="✅")
-                    save_data(all_df)
-                    st.rerun()
+        rows = [r for _, r in view.iterrows()]
+        for i in range(0, len(rows), 4):
+            for col, r in zip(st.columns(4), rows[i:i + 4]):
+                with col:
+                    task_card(r, category_options)
+
+    def task_card(r: pd.Series, category_options: list[str]) -> None:
+        t = ""
+        if r["시작시간"] or r["끝시간"]:
+            s = r["시작시간"].strftime("%H:%M") if r["시작시간"] else "--:--"
+            e = r["끝시간"].strftime("%H:%M") if r["끝시간"] else "--:--"
+            dur = "" if pd.isna(r[DUR]) else f" · {int(r[DUR])}분"
+            t = f"{s}~{e}{dur}"
+        date_txt = f"{r['작성일']:%m/%d} " if r["작성일"] else ""
+        cat = f'<span class="badge badge-cat">{html.escape(r["구분"])}</span>' if r["구분"] else ""
+        detail = f'<div class="task-detail">{nl2br(r["업무내용"])}</div>' if r["업무내용"] else ""
+        st.markdown(
+            f'<div class="task-card"><div class="task-top">{cat}'
+            f'<span class="badge st-{r["진행상태"]}">{html.escape(r["진행상태"])}</span>'
+            f'<span class="task-time">{date_txt}{t}</span></div>'
+            f'<div class="task-title">{nl2br(r["업무요약"])}</div>{detail}</div>',
+            unsafe_allow_html=True,
+        )
+        with st.expander("수정"):
+            with st.form(f"edit_{r['id']}"):
+                cats = category_options if r["구분"] in category_options else category_options + [r["구분"]]
+                e_cat = st.selectbox("구분", cats, index=cats.index(r["구분"]) if r["구분"] in cats else 0)
+                e_status = st.selectbox("진행상태", STATUSES, index=STATUSES.index(r["진행상태"]))
+                e_summary = st.text_input("업무요약", r["업무요약"])
+                e_detail = st.text_area("업무내용", r["업무내용"], height=100, help="Enter로 줄바꿈")
+                c1, c2 = st.columns(2)
+                e_start = c1.time_input("시작", r["시작시간"], step=300)
+                e_end = c2.time_input("끝", r["끝시간"], step=300)
+                e_date = st.date_input("작성일", r["작성일"] or today_kst(), format="YYYY-MM-DD")
+                e_note = st.text_input("비고", r["비고"])
+                b1, b2 = st.columns(2)
+                saved = b1.form_submit_button("저장", type="primary", width="stretch")
+                deleted = b2.form_submit_button("🗑 삭제", width="stretch")
+            if saved or deleted:
+                all_df = load_data()
+                if deleted:
+                    all_df = all_df[all_df["id"] != r["id"]]
+                    st.toast("삭제했습니다.", icon="🗑")
+                else:
+                    mask = all_df["id"] == r["id"]
+                    for col, val in [("구분", e_cat), ("진행상태", e_status), ("업무요약", e_summary),
+                                     ("업무내용", e_detail), ("시작시간", e_start), ("끝시간", e_end),
+                                     ("작성일", e_date), ("비고", e_note)]:
+                        all_df.loc[mask, col] = pd.Series([val] * mask.sum(), index=all_df.index[mask], dtype=object)
+                    st.toast("저장되었습니다.", icon="✅")
+                save_data(all_df)
+                st.rerun()
 
     def is_mobile() -> bool:
         ua = (st.context.headers.get("User-Agent") or "").lower()
@@ -604,7 +652,7 @@ def main() -> None:
 
     def date_from_url(param: str) -> date:
         """주소창(?param=YYYY-MM-DD)에 기억한 날짜. 새로고침해도 유지된다."""
-        return parse_date(st.query_params.get(param)) or date.today()
+        return parse_date(st.query_params.get(param)) or today_kst()
 
     def remember_date(key: str, param: str) -> None:
         v = st.session_state.get(key)
@@ -612,11 +660,11 @@ def main() -> None:
             st.query_params[param] = v.isoformat()
 
     def set_now(key: str) -> None:
-        st.session_state[key] = datetime.now().time().replace(second=0, microsecond=0)
+        st.session_state[key] = now_kst().time().replace(second=0, microsecond=0)
 
     settings = load_settings()
     df = load_data()
-    today = date.today()
+    today = today_kst()
 
     st.markdown(
         f'<div class="hero"><h1>📋 업무일지</h1>'
@@ -668,12 +716,15 @@ def main() -> None:
             c4.selectbox("진행상태", STATUSES, key="add_status")
 
             st.text_input("업무요약 *", key="add_summary", placeholder="보고용 한 줄 요약")
-            st.text_area("업무내용", key="add_detail", placeholder="상세 작업 내역", height=90)
+            st.text_area("업무내용", key="add_detail", height=110,
+                         placeholder="상세 작업 내역 (Enter로 줄바꿈)")
 
             c5, c6, c7, c8, c9 = st.columns([1.1, 0.7, 1.1, 0.7, 1.6], vertical_alignment="bottom")
-            c5.time_input("🕐 시작시간", key="add_start", step=300)
+            with c5:
+                time_picker("🕐 시작시간", "add_start")
             c6.button("현재 시간", key="now_start", on_click=set_now, args=("add_start",), width="stretch")
-            c7.time_input("🕐 끝시간", key="add_end", step=300)
+            with c7:
+                time_picker("🕐 끝시간", "add_end")
             c8.button("현재 시간", key="now_end", on_click=set_now, args=("add_end",), width="stretch")
             c9.text_input("비고", key="add_note")
 
@@ -694,36 +745,62 @@ def main() -> None:
                           index=0 if is_mobile() else 1)
 
         view = df if view_mode == "전체" else df[df["작성일"] == view_date]
-        if layout == "카드":
-            task_cards(view, category_options)
-        else:
-            edited = st.data_editor(
-                view.reset_index(drop=True),
-                key=f"editor_{view_mode}_{view_date}",
-                num_rows="dynamic",
-                hide_index=True,
-                width="stretch",
-                column_order=[c for c in COLUMNS if c != "id"],
-                column_config={
-                    "작성일": st.column_config.DateColumn("작성일", format="YYYY-MM-DD", width="small"),
-                    "구분": st.column_config.SelectboxColumn(
-                        "구분", options=category_options, width="small",
-                        help="새 구분은 위 '구분 직접 입력'으로 추가하세요."),
-                    "업무요약": st.column_config.TextColumn("업무요약", width="medium"),
-                    "업무내용": st.column_config.TextColumn("업무내용", width="large"),
-                    "시작시간": st.column_config.TimeColumn("시작", format="HH:mm", step=60, width="small"),
-                    "끝시간": st.column_config.TimeColumn("끝", format="HH:mm", step=60, width="small"),
-                    DUR: st.column_config.NumberColumn("소요(분)", disabled=True, width="small",
-                                                       help="저장 시 자동 계산"),
-                    "진행상태": st.column_config.SelectboxColumn("진행상태", options=STATUSES, width="small"),
-                    "비고": st.column_config.TextColumn("비고", width="medium"),
-                },
-            )
+        # 최신순: 작성일 → 시작시간 내림차순, 같으면 나중에 등록한 것 먼저 (빈 값은 뒤로)
+        order = sorted(range(len(view)), reverse=True, key=lambda i: (
+            view["작성일"].iat[i] or date.min, view["시작시간"].iat[i] or dtime.min, i))
+        view = view.iloc[order]
+        # 진행상태별로 나눠서 표시 (처리할 일 먼저). 목록에 없는 상태는 맨 뒤에 따로 묶는다.
+        groups = [(s, view[view["진행상태"] == s]) for s in STATUS_VIEW_ORDER]
+        others = view[~view["진행상태"].isin(STATUS_VIEW_ORDER)]
+        if not others.empty:
+            groups.append(("기타", others))
+        if view.empty:
+            st.caption("등록된 업무가 없습니다.")
+        edited_groups = []
+        for status, group in groups:
+            if group.empty:
+                continue
+            heading = f"{STATUS_ICONS.get(status, '•')} {status} · {len(group)}건"
+            if status == "완료":  # 완료 업무는 기본으로 접어서 목록을 깔끔하게
+                section = st.expander(heading, expanded=False)
+            else:
+                st.markdown(f"##### {heading}")
+                section = st.container()
+            with section:
+                if layout == "카드":
+                    task_cards(group, category_options)
+                    continue
+                edited_groups.append(st.data_editor(
+                    group.reset_index(drop=True),
+                    key=f"editor_{view_mode}_{view_date}_{status}",
+                    num_rows="dynamic",
+                    hide_index=True,
+                    width="stretch",
+                    column_order=[c for c in COLUMNS if c != "id"],
+                    column_config={
+                        "작성일": st.column_config.DateColumn("작성일", format="YYYY-MM-DD", width="small"),
+                        "구분": st.column_config.SelectboxColumn(
+                            "구분", options=category_options, width="small",
+                            help="새 구분은 위 '구분 직접 입력'으로 추가하세요."),
+                        "업무요약": st.column_config.TextColumn("업무요약", width="medium"),
+                        "업무내용": st.column_config.TextColumn("업무내용", width="large"),
+                        "시작시간": st.column_config.TimeColumn("시작", format="HH:mm", step=60, width="small"),
+                        "끝시간": st.column_config.TimeColumn("끝", format="HH:mm", step=60, width="small"),
+                        DUR: st.column_config.NumberColumn("소요(분)", disabled=True, width="small",
+                                                           help="저장 시 자동 계산"),
+                        "진행상태": st.column_config.SelectboxColumn(
+                            "진행상태", options=STATUSES, width="small",
+                            default=status if status in STATUSES else None),
+                        "비고": st.column_config.TextColumn("비고", width="medium"),
+                    },
+                ))
 
+        if layout == "표" and edited_groups:
             s1, s2 = st.columns([1, 4])
             if s1.button("💾 변경사항 저장", type="primary", width="stretch"):
                 rest = df[~df["id"].isin(set(view["id"]))]
                 default_date = today if view_mode == "전체" else view_date
+                edited = pd.concat(edited_groups, ignore_index=True)
                 save_data(pd.concat([rest, normalize(edited, default_date=default_date)], ignore_index=True))
                 st.toast("변경사항이 저장되었습니다.", icon="✅")
                 st.rerun()
@@ -747,10 +824,10 @@ def main() -> None:
             left, right = st.columns(2)
             with left:
                 copy_button(summary_text, "📋 업무요약 일괄 복사")
-                st.markdown(f'<div class="report-box">{html.escape(summary_text)}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="report-box">{nl2br(summary_text)}</div>', unsafe_allow_html=True)
             with right:
                 copy_button(detail_text, "📑 업무내용 일괄 복사")
-                st.markdown(f'<div class="report-box">{html.escape(detail_text)}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="report-box">{nl2br(detail_text)}</div>', unsafe_allow_html=True)
 
             # ── AI 보고문 + 카카오톡 보고 ──
             st.divider()
@@ -778,15 +855,15 @@ def main() -> None:
                     except RuntimeError as exc:
                         st.error(str(exc))
 
-            with st.expander("🔑 AI 설정 (Anthropic API 키)", expanded=not api_key):
-                if os.environ.get("ANTHROPIC_API_KEY"):
-                    st.caption("환경변수 ANTHROPIC_API_KEY의 키를 사용 중입니다.")
+            with st.expander("🔑 AI 설정 (Gemini API 키)", expanded=not api_key):
+                if secret_value("GEMINI_API_KEY"):
+                    st.caption("환경변수 또는 .streamlit/secrets.toml의 GEMINI_API_KEY를 사용 중입니다.")
                 else:
                     with st.form("api_key_form"):
-                        new_key = st.text_input("API 키", type="password", placeholder="sk-ant-...",
-                                                help="console.anthropic.com에서 발급. 이 PC의 data/settings.json에만 저장됩니다.")
+                        new_key = st.text_input("API 키", type="password", placeholder="Gemini API 키",
+                                                help="aistudio.google.com에서 발급. 이 PC의 data/settings.json에만 저장됩니다.")
                         if st.form_submit_button("키 저장", width="stretch"):
-                            settings["anthropic_api_key"] = new_key.strip()
+                            settings["gemini_api_key"] = new_key.strip()
                             save_settings(settings)
                             st.rerun()
                     st.caption("키가 저장되어 있습니다." if api_key else
@@ -795,7 +872,7 @@ def main() -> None:
             if ai_saved:
                 st.markdown("**📄 보고용 텍스트**")
                 copy_button(ai_saved["report"], "📋 보고용 텍스트 복사")
-                st.markdown(f'<div class="report-box">{html.escape(ai_saved["report"])}</div>',
+                st.markdown(f'<div class="report-box">{nl2br(ai_saved["report"])}</div>',
                             unsafe_allow_html=True)
 
             st.markdown("**💬 카카오톡 상사 보고용**")
@@ -914,7 +991,7 @@ def main() -> None:
                 path = create_backup()
                 st.toast(f"백업 완료: {path.name}", icon="✅")
             d1, d2 = st.columns(2)
-            stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+            stamp = f"{now_kst():%Y%m%d_%H%M%S}"
             d1.download_button("⬇️ CSV 다운로드", to_storage(df).drop(columns="id").to_csv(index=False).encode("utf-8-sig"),
                                file_name=f"업무일지_{stamp}.csv", mime="text/csv", width="stretch")
             d2.download_button("⬇️ Excel 다운로드", export_excel(df), file_name=f"업무일지_{stamp}.xlsx",

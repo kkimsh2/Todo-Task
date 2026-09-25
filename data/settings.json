@@ -1,0 +1,10 @@
+{
+  "auto_backup": true,
+  "backup_hour": 18,
+  "weekdays_only": true,
+  "keep_days": 30,
+  "standard_min": 480,
+  "last_auto_backup": "2026-09-25",
+  "report_title": "과장님",
+  "gemini_api_key": ""
+}
