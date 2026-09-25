@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import shutil
 import sys
 import threading
@@ -24,6 +25,8 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_FILE = DATA_DIR / "worklog.csv"
 SETTINGS_FILE = DATA_DIR / "settings.json"
+AI_REPORTS_FILE = DATA_DIR / "ai_reports.json"
+AI_MODEL = "claude-opus-5"
 BACKUP_DIR = BASE_DIR / "backups"
 BACKUP_PREFIX = "[백업] 업무일지_"
 
@@ -39,6 +42,8 @@ DEFAULT_SETTINGS = {
     "keep_days": 30,           # 0 = 오래된 백업 삭제 안 함
     "standard_min": 480,       # 과중 업무 판단 기준(분)
     "last_auto_backup": "",
+    "report_title": "과장님",  # 카카오톡 보고 받는 분 호칭
+    "anthropic_api_key": "",   # 환경변수 ANTHROPIC_API_KEY가 있으면 그쪽 우선
 }
 
 _file_lock = threading.Lock()
@@ -186,6 +191,112 @@ def build_report(df: pd.DataFrame, target: date, kind: str) -> tuple[str, int]:
             detail = " ".join(r["업무내용"].split("\n")).strip()
             lines.append(f"- {head}{r['업무요약']}" + (f" - {detail}" if detail else ""))
     return "\n".join(lines), len(lines)
+
+
+def day_label(target: date) -> str:
+    return "금일" if target == date.today() else f"{target.month}월 {target.day}일"
+
+
+def build_kakao_template(df: pd.DataFrame, target: date, title: str) -> str:
+    """AI 없이 만드는 카카오톡 보고 기본 양식."""
+    rows = df[(df["작성일"] == target) & (df["업무요약"] != "")]
+    items = []
+    for i, (_, r) in enumerate(rows.iterrows(), 1):
+        status = "" if r["진행상태"] == "완료" else f" ({r['진행상태']})"
+        items.append(f"{i}. {r['업무요약']}{status}")
+    return (f"{title}, {day_label(target)} 업무 보고드립니다.\n\n" + "\n".join(items)
+            + "\n\n이상입니다. 감사합니다.")
+
+
+def load_ai_reports() -> dict:
+    if AI_REPORTS_FILE.exists():
+        try:
+            return json.loads(AI_REPORTS_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_ai_report(target: date, result: dict) -> None:
+    data = load_ai_reports()
+    data[target.isoformat()] = {**result, "created": datetime.now().isoformat(timespec="seconds")}
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with _file_lock:
+        AI_REPORTS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+AI_SYSTEM_PROMPT = """당신은 한국 회사원의 업무 보고를 다듬는 비서입니다.
+사용자가 적은 하루 업무 기록을 받아 두 가지 텍스트를 만듭니다.
+
+1. report: 사내 보고용 개조식 요약
+   - 업무마다 "- " 로 시작하는 한 줄. 명사형 종결(예: "~ 기안 상신 완료", "~ 검토 진행 중").
+   - 비슷한 업무는 한 줄로 묶고, 핵심 결과·수치·다음 단계만 남깁니다.
+   - 진행상태가 완료가 아니면 "(진행 중)", "(대기)", "(보류)"처럼 표시합니다.
+2. kakao: 카카오톡으로 상사에게 보내는 보고 메시지
+   - 첫 줄: "{호칭}, {날짜표현} 업무 보고드립니다."
+   - 빈 줄 뒤 "1. ", "2. " 번호 목록으로 업무를 적습니다. 한 항목은 한두 줄, 정중한 합니다체.
+   - 빈 줄 뒤 마지막 줄: "이상입니다. 감사합니다."
+   - 이모지와 과한 수식어는 쓰지 않습니다.
+
+기록에 없는 사실·수치·일정은 지어내지 마세요. 개인 업무(구분이 '개인')는 보고에서 뺍니다."""
+
+AI_SCHEMA = {
+    "type": "object",
+    "properties": {"report": {"type": "string"}, "kakao": {"type": "string"}},
+    "required": ["report", "kakao"],
+    "additionalProperties": False,
+}
+
+
+def resolve_api_key(settings: dict) -> str:
+    return os.environ.get("ANTHROPIC_API_KEY", "").strip() or str(settings.get("anthropic_api_key", "")).strip()
+
+
+def generate_ai_report(df: pd.DataFrame, target: date, title: str, api_key: str) -> dict:
+    """Claude로 보고용 요약 + 카카오톡 메시지 생성. 실패 시 RuntimeError(사용자용 메시지)."""
+    import anthropic
+
+    rows = df[(df["작성일"] == target) & (df["업무요약"] != "")]
+    entries = []
+    for _, r in rows.iterrows():
+        t = f"{r['시작시간']:%H:%M}~{r['끝시간']:%H:%M}" if r["시작시간"] and r["끝시간"] else ""
+        entries.append({"구분": r["구분"], "업무요약": r["업무요약"], "업무내용": r["업무내용"],
+                        "시간": t, "진행상태": r["진행상태"], "비고": r["비고"]})
+    user_msg = (f"호칭: {title}\n날짜표현: {day_label(target)}\n날짜: {target.isoformat()}\n\n"
+                f"업무 기록(JSON):\n{json.dumps(entries, ensure_ascii=False, indent=1)}")
+
+    client = anthropic.Anthropic(api_key=api_key, timeout=90.0)
+    try:
+        resp = client.beta.messages.create(
+            model=AI_MODEL,
+            max_tokens=4000,
+            system=AI_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_msg}],
+            output_config={"effort": "low", "format": {"type": "json_schema", "schema": AI_SCHEMA}},
+            betas=["server-side-fallback-2026-07-01"],
+            fallbacks="default",
+        )
+    except anthropic.AuthenticationError:
+        raise RuntimeError("API 키가 올바르지 않습니다. 키를 다시 확인해 주세요.")
+    except anthropic.PermissionDeniedError:
+        raise RuntimeError("이 API 키로는 모델을 사용할 권한이 없습니다.")
+    except anthropic.RateLimitError:
+        raise RuntimeError("요청이 많아 잠시 제한되었습니다. 1분 뒤 다시 시도해 주세요.")
+    except anthropic.APIStatusError as e:
+        raise RuntimeError(f"AI 서버 오류({e.status_code}): {e.message}")
+    except anthropic.APIConnectionError:
+        raise RuntimeError("AI 서버에 연결하지 못했습니다. 인터넷 연결을 확인해 주세요.")
+
+    if resp.stop_reason == "refusal":
+        raise RuntimeError("AI가 이 내용의 요약을 거절했습니다. 기본 양식을 사용해 주세요.")
+    if resp.stop_reason == "max_tokens":
+        raise RuntimeError("업무가 너무 많아 답변이 잘렸습니다. 다시 시도해 주세요.")
+    text = next((b.text for b in resp.content if b.type == "text"), "")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        raise RuntimeError("AI 응답을 읽지 못했습니다. 다시 시도해 주세요.")
+    return {"report": data["report"].strip(), "kakao": data["kakao"].strip()}
 
 
 # ─────────────────────────────── 백업 ───────────────────────────────
@@ -487,6 +598,22 @@ def main() -> None:
             height=52,
         )
 
+    def init_state(key: str, value) -> None:
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+    def date_from_url(param: str) -> date:
+        """주소창(?param=YYYY-MM-DD)에 기억한 날짜. 새로고침해도 유지된다."""
+        return parse_date(st.query_params.get(param)) or date.today()
+
+    def remember_date(key: str, param: str) -> None:
+        v = st.session_state.get(key)
+        if isinstance(v, date):
+            st.query_params[param] = v.isoformat()
+
+    def set_now(key: str) -> None:
+        st.session_state[key] = datetime.now().time().replace(second=0, microsecond=0)
+
     settings = load_settings()
     df = load_data()
     today = date.today()
@@ -503,45 +630,66 @@ def main() -> None:
 
     # ───── 업무일지 입력 ─────
     with tab_log:
+        def add_task() -> None:
+            """'현재 시간' 버튼을 쓰려고 폼 대신 콜백으로 저장. 작성일·구분·상태는 다음 입력을 위해 유지."""
+            ss = st.session_state
+            category = ss.add_cat_custom.strip() or ss.add_cat
+            if not ss.add_summary.strip():
+                ss["add_flash"] = [("error", "업무요약을 입력하세요.")]
+                return
+            new = pd.DataFrame([{
+                "id": "", "작성일": ss.add_date, "구분": category, "업무요약": ss.add_summary,
+                "업무내용": ss.add_detail, "시작시간": ss.add_start, "끝시간": ss.add_end,
+                "진행상태": ss.add_status, "비고": ss.add_note,
+            }])
+            save_data(pd.concat([load_data(), new], ignore_index=True))
+            flash = []
+            if category not in CATEGORIES:
+                flash.append(("⚠️", f"기본 목록에 없는 구분 '{category}'(으)로 저장했습니다."))
+            if ss.add_start and ss.add_end and ss.add_end < ss.add_start:
+                flash.append(("⚠️", "끝시간이 시작시간보다 이릅니다. 자정을 넘긴 업무로 계산했습니다."))
+            flash.append(("✅", "저장되었습니다."))
+            ss["add_flash"] = flash
+            for k, v in [("add_cat_custom", ""), ("add_summary", ""), ("add_detail", ""),
+                         ("add_start", None), ("add_end", None), ("add_note", "")]:
+                ss[k] = v
+
         with st.expander("➕ 새 업무 추가", expanded=not is_mobile()):
-            with st.form("add_form", clear_on_submit=True):
-                c1, c2, c3, c4 = st.columns([1.1, 1.1, 1.3, 1])
-                f_date = c1.date_input("작성일", value=today, format="YYYY-MM-DD")
-                f_cat = c2.selectbox("구분", category_options)
-                f_cat_custom = c3.text_input("구분 직접 입력", placeholder="입력 시 우선 적용")
-                f_status = c4.selectbox("진행상태", STATUSES)
+            init_state("add_date", date_from_url("d"))
+            for k, v in [("add_cat_custom", ""), ("add_summary", ""), ("add_detail", ""),
+                         ("add_start", None), ("add_end", None), ("add_note", "")]:
+                init_state(k, v)
 
-                f_summary = st.text_input("업무요약 *", placeholder="보고용 한 줄 요약")
-                f_detail = st.text_area("업무내용", placeholder="상세 작업 내역", height=90)
+            c1, c2, c3, c4 = st.columns([1.1, 1.1, 1.3, 1])
+            c1.date_input("작성일", key="add_date", format="YYYY-MM-DD",
+                          on_change=remember_date, args=("add_date", "d"))
+            c2.selectbox("구분", category_options, key="add_cat")
+            c3.text_input("구분 직접 입력", key="add_cat_custom", placeholder="입력 시 우선 적용")
+            c4.selectbox("진행상태", STATUSES, key="add_status")
 
-                c5, c6, c7 = st.columns([1, 1, 2])
-                f_start = c5.time_input("시작시간", value=None, step=300)
-                f_end = c6.time_input("끝시간", value=None, step=300)
-                f_note = c7.text_input("비고")
+            st.text_input("업무요약 *", key="add_summary", placeholder="보고용 한 줄 요약")
+            st.text_area("업무내용", key="add_detail", placeholder="상세 작업 내역", height=90)
 
-                if st.form_submit_button("저장", type="primary", width="stretch"):
-                    category = f_cat_custom.strip() or f_cat
-                    if not f_summary.strip():
-                        st.error("업무요약을 입력하세요.")
-                    else:
-                        new = pd.DataFrame([{
-                            "id": "", "작성일": f_date, "구분": category, "업무요약": f_summary,
-                            "업무내용": f_detail, "시작시간": f_start, "끝시간": f_end,
-                            "진행상태": f_status, "비고": f_note,
-                        }])
-                        save_data(pd.concat([df, new], ignore_index=True))
-                        if category not in CATEGORIES:
-                            st.toast(f"기본 목록에 없는 구분 '{category}'(으)로 저장했습니다.", icon="⚠️")
-                        if f_start and f_end and f_end < f_start:
-                            st.toast("끝시간이 시작시간보다 이릅니다. 자정을 넘긴 업무로 계산했습니다.", icon="⚠️")
-                        st.toast("저장되었습니다.", icon="✅")
-                        st.rerun()
+            c5, c6, c7, c8, c9 = st.columns([1.1, 0.7, 1.1, 0.7, 1.6], vertical_alignment="bottom")
+            c5.time_input("🕐 시작시간", key="add_start", step=300)
+            c6.button("현재 시간", key="now_start", on_click=set_now, args=("add_start",), width="stretch")
+            c7.time_input("🕐 끝시간", key="add_end", step=300)
+            c8.button("현재 시간", key="now_end", on_click=set_now, args=("add_end",), width="stretch")
+            c9.text_input("비고", key="add_note")
+
+            st.button("저장", type="primary", width="stretch", on_click=add_task)
+            for icon, msg in st.session_state.pop("add_flash", []):
+                if icon == "error":
+                    st.error(msg)
+                else:
+                    st.toast(msg, icon=icon)
 
         st.subheader("업무 목록")
         v1, v2, v3 = st.columns([1.2, 1.2, 1.2])
         view_mode = v1.radio("보기", ["선택한 날짜", "전체"], horizontal=True, label_visibility="collapsed")
-        view_date = v2.date_input("날짜", value=today, format="YYYY-MM-DD", label_visibility="collapsed",
-                                  disabled=view_mode == "전체")
+        init_state("view_date", date_from_url("vd"))
+        view_date = v2.date_input("날짜", key="view_date", format="YYYY-MM-DD", label_visibility="collapsed",
+                                  disabled=view_mode == "전체", on_change=remember_date, args=("view_date", "vd"))
         layout = v3.radio("형식", ["카드", "표"], horizontal=True, label_visibility="collapsed",
                           index=0 if is_mobile() else 1)
 
@@ -585,7 +733,9 @@ def main() -> None:
     # ───── 일일 보고 ─────
     with tab_report:
         r1, _ = st.columns([1, 3])
-        report_date = r1.date_input("보고 날짜", value=today, format="YYYY-MM-DD", key="report_date")
+        init_state("report_date", date_from_url("rd"))
+        report_date = r1.date_input("보고 날짜", key="report_date", format="YYYY-MM-DD",
+                                    on_change=remember_date, args=("report_date", "rd"))
 
         summary_text, n = build_report(df, report_date, "summary")
         detail_text, _ = build_report(df, report_date, "detail")
@@ -601,6 +751,61 @@ def main() -> None:
             with right:
                 copy_button(detail_text, "📑 업무내용 일괄 복사")
                 st.markdown(f'<div class="report-box">{html.escape(detail_text)}</div>', unsafe_allow_html=True)
+
+            # ── AI 보고문 + 카카오톡 보고 ──
+            st.divider()
+            st.markdown("#### ✨ AI 보고문")
+            api_key = resolve_api_key(settings)
+            ai_saved = load_ai_reports().get(report_date.isoformat())
+            kakao_key = f"kakao_{report_date.isoformat()}"
+
+            def change_title() -> None:
+                settings["report_title"] = st.session_state.report_title.strip() or "과장님"
+                save_settings(settings)
+                for k in [k for k in st.session_state if str(k).startswith("kakao_")]:
+                    del st.session_state[k]  # 기본 양식을 새 호칭으로 다시 만든다
+
+            init_state("report_title", settings["report_title"])
+            a1, a2 = st.columns([1, 2], vertical_alignment="bottom")
+            title = a1.text_input("보고 받는 분 호칭", key="report_title", on_change=change_title,
+                                  placeholder="예: 전무님, 과장님")
+            if a2.button("✨ AI로 보고문 다듬기", type="primary", width="stretch", disabled=not api_key):
+                with st.spinner("AI가 보고문을 다듬고 있습니다…"):
+                    try:
+                        ai_saved = generate_ai_report(df, report_date, title.strip() or "과장님", api_key)
+                        save_ai_report(report_date, ai_saved)
+                        st.session_state[kakao_key] = ai_saved["kakao"]
+                    except RuntimeError as exc:
+                        st.error(str(exc))
+
+            with st.expander("🔑 AI 설정 (Anthropic API 키)", expanded=not api_key):
+                if os.environ.get("ANTHROPIC_API_KEY"):
+                    st.caption("환경변수 ANTHROPIC_API_KEY의 키를 사용 중입니다.")
+                else:
+                    with st.form("api_key_form"):
+                        new_key = st.text_input("API 키", type="password", placeholder="sk-ant-...",
+                                                help="console.anthropic.com에서 발급. 이 PC의 data/settings.json에만 저장됩니다.")
+                        if st.form_submit_button("키 저장", width="stretch"):
+                            settings["anthropic_api_key"] = new_key.strip()
+                            save_settings(settings)
+                            st.rerun()
+                    st.caption("키가 저장되어 있습니다." if api_key else
+                               "키가 없으면 AI 기능은 꺼지고, 아래 카카오톡 보고는 기본 양식으로 만들어집니다.")
+
+            if ai_saved:
+                st.markdown("**📄 보고용 텍스트**")
+                copy_button(ai_saved["report"], "📋 보고용 텍스트 복사")
+                st.markdown(f'<div class="report-box">{html.escape(ai_saved["report"])}</div>',
+                            unsafe_allow_html=True)
+
+            st.markdown("**💬 카카오톡 상사 보고용**")
+            init_state(kakao_key, ai_saved["kakao"] if ai_saved else
+                       build_kakao_template(df, report_date, settings["report_title"]))
+            kakao_text = st.text_area("카카오톡 보고 메시지", key=kakao_key, height=220,
+                                      label_visibility="collapsed")
+            copy_button(kakao_text, "💬 카카오톡 보고 복사")
+            st.caption(("AI가 다듬은 문구입니다." if ai_saved else "기본 양식입니다.")
+                       + " 칸 안에서 직접 고친 뒤 복사할 수 있습니다.")
 
     # ───── KPI 대시보드 ─────
     with tab_kpi:
